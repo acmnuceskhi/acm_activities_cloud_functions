@@ -1,0 +1,28 @@
+rules_version = '2';
+
+
+service cloud.firestore {
+
+  match /databases/{database}/documents {
+    
+    match /games/{gameId}/responses/{responseId} {
+    
+    	// Allow only authenticated users to add responses
+    	allow create: if request.auth != null;
+      
+      // Allow only admins to update responses
+      allow write, update: if request.auth != null && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+    
+    // Allow adding and editing games only for admins
+    match /games/{gameId} {
+    	allow read: if true;
+      allow write: if request.auth != null && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+    
+    match /{document=**} {
+      allow read: if true;
+      allow write: if request.auth != null && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+  }
+}
