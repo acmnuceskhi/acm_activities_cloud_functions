@@ -11,6 +11,13 @@ setGlobalOptions({ maxInstances: 10 });
 
 admin.initializeApp();
 
+// Simple helper to set permissive CORS headers for browser clients.
+function setCorsHeaders(res) {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+}
+
 // CONFIGURATION: set your comic game id here. The user said they'll set this manually.
 const COMIC_GAME_ID = 'PuNpV5UjO1EQ4qBFXOhL';
 // How many frames to return after the user's last solved question
@@ -23,7 +30,11 @@ const N_FRAMES = 10; // <-- change this if you want a different hardcoded value
  *  - searches for the response document with the provided `code` inside
  *    games/{COMIC_GAME_ID}/responses
  *  - reads the user's `score` field (assumed numeric).
- *    We interpret solvedQuestions = Math.floor(score) || 0.
+ *    Interpretation:
+ *      - If the `score` field is null or missing, treat it as "no questions solved".
+ *        In that case we set lastAnsweredIndex = -1 so frame 0 is included for new players.
+ *      - If `score` is a number (including 0) we treat Math.floor(score) as the index of
+ *        the frame where the last question was correctly answered (so 0 is a valid value).
  *  - fetches up to N_FRAMES frames from comic_game/frames/frames where
  *    index > solvedQuestions. Frames are ordered by their `index`.
  *  - for each frame, finds the question set in comic_game/questions/sets
@@ -38,6 +49,12 @@ const N_FRAMES = 10; // <-- change this if you want a different hardcoded value
  */
 exports.getNextFrames = onRequest(async (req, res) => {
   try {
+    // handle CORS preflight
+    if (req.method === 'OPTIONS') {
+      setCorsHeaders(res);
+      return res.status(204).send('');
+    }
+    setCorsHeaders(res);
     const code = (req.method === 'GET') ? (req.query.code || '') : (req.body && req.body.code) || '';
     if (!code || String(code).trim().length === 0) {
       return res.status(400).json({ success: false, message: 'Missing code parameter' });
@@ -62,11 +79,13 @@ exports.getNextFrames = onRequest(async (req, res) => {
     const resp = respDoc.data() || {};
     // NEW BEHAVIOR: resp.score now holds the frame index of the last correctly answered question.
     // If missing, treat as -1 so frame 0 is included for new players.
-    const rawScore = resp.score;
+    // Explicitly treat null/undefined as "no questions solved" -> lastAnsweredIndex = -1.
+    const rawScore = (resp && Object.prototype.hasOwnProperty.call(resp, 'score')) ? resp.score : null;
     let lastAnsweredIndex = -1;
     if (rawScore !== undefined && rawScore !== null) {
       const num = Number(rawScore);
       if (!Number.isNaN(num)) {
+        // numeric values including 0 are valid and represent the last answered frame index
         lastAnsweredIndex = Math.floor(num);
       }
     }
@@ -95,7 +114,10 @@ exports.getNextFrames = onRequest(async (req, res) => {
       const frameData = doc.data();
       const frameIndex = frameData.index;
 
-      frames.push({ id: doc.id, ...frameData });
+  // include musicId from frame if present
+  const musicId = frameData.musicId || frameData.audioId || frameData.music || null;
+
+  frames.push({ id: doc.id, musicId, ...frameData });
 
       // New schema: frames now store the question set id directly on the frame document.
       const setIdFromFrame = frameData.questionSetId || frameData.questionSet || frameData.setId || null;
@@ -143,6 +165,36 @@ exports.getNextFrames = onRequest(async (req, res) => {
     return res.json({ success: true, lastAnsweredIndex, frames, questions: questionResults });
   } catch (err) {
     logger.error('getNextFrames failed', err);
+    setCorsHeaders(res);
+    return res.status(500).json({ success: false, message: 'Internal error', error: String(err) });
+  }
+});
+
+/**
+ * HTTP function: getMusicLibrary
+ * Returns a mapping of musicId -> audioUrl for all music docs under comic_game/music/music
+ */
+exports.getMusicLibrary = onRequest(async (req, res) => {
+  try {
+    // CORS preflight
+    if (req.method === 'OPTIONS') {
+      setCorsHeaders(res);
+      return res.status(204).send('');
+    }
+    setCorsHeaders(res);
+
+    const musicRef = admin.firestore().collection('comic_game').doc('music').collection('music');
+    const snap = await musicRef.get();
+    const result = {};
+    for (const d of snap.docs) {
+      const data = d.data() || {};
+      const audioUrl = data.audioUrl || data.url || data.audio || null;
+      if (audioUrl) result[d.id] = audioUrl;
+    }
+    return res.json({ success: true, musics: result });
+  } catch (err) {
+    logger.error('getMusicLibrary failed', err);
+    setCorsHeaders(res);
     return res.status(500).json({ success: false, message: 'Internal error', error: String(err) });
   }
 });
@@ -159,6 +211,12 @@ exports.getNextFrames = onRequest(async (req, res) => {
  */
 exports.submitAnswer = onRequest(async (req, res) => {
   try {
+    // handle CORS preflight
+    if (req.method === 'OPTIONS') {
+      setCorsHeaders(res);
+      return res.status(204).send('');
+    }
+    setCorsHeaders(res);
     if (req.method !== 'POST') {
       return res.status(405).json({ success: false, message: 'POST required' });
     }
@@ -222,30 +280,35 @@ exports.submitAnswer = onRequest(async (req, res) => {
       } else {
         const frameDoc = frameSnap.docs[0];
         const frameData = frameDoc.data() || {};
-        const frameIndex = Number(frameData.index || 0);
-
-        // atomically update response.score to the frameIndex, but only if it's newer (greater)
-        await admin.firestore().runTransaction(async (tx) => {
-          const r = await tx.get(respDocRef);
-          if (!r.exists) {
-            throw new Error('Response doc disappeared');
-          }
-          const currentRaw = r.data().score;
-          let currentIndex = -1;
-          if (currentRaw !== undefined && currentRaw !== null) {
-            const n = Number(currentRaw);
-            if (!Number.isNaN(n)) currentIndex = Math.floor(n);
-          }
-          if (frameIndex > currentIndex) {
-            tx.update(respDocRef, { score: frameIndex });
-          }
-        });
+        const frameIndex = Number(frameData.index);
+        if (Number.isNaN(frameIndex)) {
+          logger.warn('submitAnswer: frame index is not a number', frameData);
+        } else {
+          // atomically update response.score to the frameIndex, but only if it's newer (greater)
+          await admin.firestore().runTransaction(async (tx) => {
+            const r = await tx.get(respDocRef);
+            if (!r.exists) {
+              throw new Error('Response doc disappeared');
+            }
+            const data = r.data() || {};
+            const currentRaw = Object.prototype.hasOwnProperty.call(data, 'score') ? data.score : null;
+            let currentIndex = -1;
+            if (currentRaw !== undefined && currentRaw !== null) {
+              const n = Number(currentRaw);
+              if (!Number.isNaN(n)) currentIndex = Math.floor(n);
+            }
+            if (frameIndex > currentIndex) {
+              tx.update(respDocRef, { score: frameIndex });
+            }
+          });
+        }
       }
     }
 
     return res.json({ success: true, correct: isCorrect });
   } catch (err) {
     logger.error('submitAnswer failed', err);
+    setCorsHeaders(res);
     return res.status(500).json({ success: false, message: 'Internal error', error: String(err) });
   }
 });
