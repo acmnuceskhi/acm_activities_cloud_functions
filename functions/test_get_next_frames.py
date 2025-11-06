@@ -25,32 +25,29 @@ except Exception:
     requests = None
 
 
-def call_function(url, code, method='GET', timeout=10):
-    payload = {'code': code}
+def call_function(url, id_token=None, method='GET', timeout=10):
     headers = {'Content-Type': 'application/json'}
+    if id_token:
+        headers['Authorization'] = f'Bearer {id_token}'
 
     if method.upper() == 'GET':
-        # attach as query param
-        separator = '&' if '?' in url else '?'
-        full = f"{url}{separator}code={requests.utils.requote_uri(str(code))}" if requests else f"{url}?code={code}"
         if requests:
-            r = requests.get(full, timeout=timeout)
+            r = requests.get(url, headers=headers, timeout=timeout)
             return r.status_code, r.text
         else:
-            # fallback to urllib
-            from urllib import request, parse
-            full = f"{url}?{parse.urlencode({'code': code})}"
-            with request.urlopen(full, timeout=timeout) as resp:
+            # fallback to urllib (no header support for token)
+            from urllib import request
+            req = request.Request(url, headers=headers)
+            with request.urlopen(req, timeout=timeout) as resp:
                 return resp.getcode(), resp.read().decode('utf-8')
 
     else:
         if requests:
-            r = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            r = requests.post(url, headers=headers, timeout=timeout)
             return r.status_code, r.text
         else:
             import urllib.request
-            import urllib.parse
-            data = json.dumps(payload).encode('utf-8')
+            data = b''
             req = urllib.request.Request(url, data=data, headers=headers, method='POST')
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.getcode(), resp.read().decode('utf-8')
@@ -97,21 +94,22 @@ def pretty_print_response(text):
 def main():
     parser = argparse.ArgumentParser(description='Test getNextFrames Cloud Function')
     parser.add_argument('--url', '-u', required=True, help='Full function URL (e.g. https://REGION-PROJECT.cloudfunctions.net/getNextFrames)')
-    parser.add_argument('--code', '-c', required=True, help='Registration/code to look up')
+    parser.add_argument('--id-token', dest='id_token', help='Firebase ID token (Bearer) for authentication')
+    parser.add_argument('--method', '-m', choices=['GET', 'POST'], default='GET', help='HTTP method to use (default GET)')
     parser.add_argument('--method', '-m', choices=['GET', 'POST'], default='GET', help='HTTP method to use (default GET)')
     parser.add_argument('--timeout', type=float, default=10.0, help='Request timeout seconds')
 
     args = parser.parse_args()
 
     if args.method == 'GET' and args.url.endswith('/'):
-        # remove trailing slash for GET so query attach is clean
+        # remove trailing slash for GET
         args.url = args.url[:-1]
 
     if requests is None:
         print('requests library not found: falling back to urllib. For best experience install requests: pip install requests')
 
     try:
-        status, text = call_function(args.url, args.code, method=args.method, timeout=args.timeout)
+        status, text = call_function(args.url, id_token=args.id_token, method=args.method, timeout=args.timeout)
     except Exception as e:
         print('Request failed:', e)
         sys.exit(2)

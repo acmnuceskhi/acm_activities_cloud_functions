@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='Test submitAnswer HTTP function')
     p.add_argument('--url', default='https://us-central1-coder-s-cup-minigames.cloudfunctions.net/submitAnswer',
                    help='Full function URL')
-    p.add_argument('--code', required=True, help='Registration code')
+    p.add_argument('--id-token', dest='id_token', help='Firebase ID token (Bearer) for authentication')
     p.add_argument('--set', dest='set_id', required=True, help='Question set id')
     p.add_argument('--qid', required=True, help='Question id')
     p.add_argument('--answer', required=True, help='Answer text to submit')
@@ -77,7 +77,6 @@ def do_post_urllib(url: str, payload: dict) -> None:
 def main() -> None:
     args = parse_args()
     payload = {
-        'code': args.code,
         'questionSetId': args.set_id,
         'questionId': args.qid,
         'answer': args.answer,
@@ -91,8 +90,20 @@ def main() -> None:
         return
 
     print('\nExecuting POST...')
+    headers = {'Content-Type': 'application/json'}
+    if args.id_token:
+        headers['Authorization'] = f'Bearer {args.id_token}'
+
     if HAS_REQUESTS:
-        do_post_requests(args.url, payload)
+        try:
+            r = requests.post(args.url, json=payload, headers=headers, timeout=15)
+            print('HTTP', r.status_code)
+            try:
+                print(json.dumps(r.json(), indent=2))
+            except Exception:
+                print(r.text)
+        except Exception as e:
+            print('Request failed:', e)
     else:
         do_post_urllib(args.url, payload)
 
